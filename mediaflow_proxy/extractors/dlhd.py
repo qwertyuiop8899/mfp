@@ -1,6 +1,8 @@
 import re
 import base64
 import logging
+import asyncio
+import time
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse, quote_plus
 
@@ -26,6 +28,71 @@ class DLHDExtractor(BaseExtractor):
         self._cached_base_url: Optional[str] = None
         self._iframe_context: Optional[str] = None
         self._auth_cache: Dict[str, Dict[str, Any]] = {}
+        # auth_cache[channel_id] = { auth_data: {...}, iframe_url: str, stream_result: {...}, timestamp: float, refreshing?: bool }
+        self.auth_cache_max_age = 1200  # 20 minuti TTL locale
+        self.auth_background_refresh_interval = 600  # ogni 10 minuti refresh soft
+        self._refresh_tasks: Dict[str, asyncio.Task] = {}
+
+    # ---------------- Cache helpers -----------------
+    def is_auth_expired(self, channel_id: str) -> bool:
+        entry = self._auth_cache.get(channel_id)
+        if not entry:
+            return True
+        age = time.time() - entry.get('timestamp', 0)
+        if age > self.auth_cache_max_age:
+            # non cancelliamo qui: lasciamo che l'estrazione nuova sovrascriva / il chiamante la invalidi se serve
+            return True
+        return False
+
+    def _ensure_background_refresh(self, channel_id: str, original_url: str) -> None:
+        if channel_id in self._refresh_tasks:
+            t = self._refresh_tasks[channel_id]
+            if not t.done():
+                return
+            self._refresh_tasks.pop(channel_id, None)
+        self._refresh_tasks[channel_id] = asyncio.create_task(self._background_refresh_loop(channel_id, original_url), name=f"dlhd-soft-refresh-{channel_id}")
+
+    async def _background_refresh_loop(self, channel_id: str, original_url: str):
+        try:
+            while True:
+                entry = self._auth_cache.get(channel_id)
+                if not entry:
+                    break
+                age = time.time() - entry.get('timestamp', 0)
+                if age >= self.auth_cache_max_age:
+                    # lascia scadere: il path principale farà la nuova auth
+                    break
+                if age < self.auth_background_refresh_interval:
+                    # dorme finché non raggiunge la finestra di refresh
+                    sleep_for = self.auth_background_refresh_interval - age
+                    try:
+                        await asyncio.sleep(min(sleep_for, self.auth_background_refresh_interval))
+                    except asyncio.CancelledError:
+                        break
+                    continue
+                # pronto per soft refresh
+                if entry.get('refreshing'):
+                    await asyncio.sleep(5)
+                    continue
+                entry['refreshing'] = True
+                logger.info(f"[DLHD] Soft auth refresh start channel={channel_id} age={age:.0f}s")
+                try:
+                    await self._extract_internal(original_url, force_refresh=True)
+                    logger.info(f"[DLHD] Soft auth refresh success channel={channel_id}")
+                except Exception as e:
+                    logger.warning(f"[DLHD] Soft auth refresh failed channel={channel_id}: {e}")
+                    entry.pop('refreshing', None)
+                    await asyncio.sleep(self.auth_background_refresh_interval/3)
+                    continue
+                # remove flag and loop
+                new_entry = self._auth_cache.get(channel_id)
+                if new_entry:
+                    new_entry.pop('refreshing', None)
+        finally:
+            task = self._refresh_tasks.get(channel_id)
+            if task and task.done():
+                self._refresh_tasks.pop(channel_id, None)
+
 
     def _get_headers_for_url(self, url: str, base_headers: dict) -> dict:
         """Return headers adapted for newkso.ru or other domains if needed."""
@@ -70,7 +137,7 @@ class DLHDExtractor(BaseExtractor):
                 return response
 
     async def extract(self, url: str, **kwargs) -> Dict[str, Any]:
-        """Main extraction flow: resolve base, fetch players, extract iframe, auth and final m3u8."""
+        """Main extraction flow con cache + soft background refresh."""
         from urllib.parse import urlparse
 
         async def resolve_base_url(preferred_host: Optional[str] = None) -> str:
@@ -126,7 +193,14 @@ class DLHDExtractor(BaseExtractor):
                 return match_direct.group(1)
             return None
 
-        async def get_stream_data(baseurl: str, initial_url: str, channel_id: str):
+        async def get_stream_data(baseurl: str, initial_url: str, channel_id: str, force_refresh: bool = False):
+            # cache hit (non forzato, non scaduta)
+            if not force_refresh and not self.is_auth_expired(channel_id):
+                entry = self._auth_cache.get(channel_id)
+                if entry and 'stream_result' in entry:
+                    self._ensure_background_refresh(channel_id, initial_url)
+                    logger.debug(f"[DLHD] Cache hit channel={channel_id}")
+                    return entry['stream_result']
             daddy_origin = urlparse(baseurl).scheme + "://" + urlparse(baseurl).netloc
             daddylive_headers = {
                 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
@@ -379,7 +453,12 @@ class DLHDExtractor(BaseExtractor):
                 }
                 logger.info("Using 'hls_key_proxy' for DLHD stream. Only the key will be proxied.")
 
-            # cache auth data
+            stream_result = {
+                "destination_url": clean_m3u8_url,
+                "request_headers": stream_headers,
+                "mediaflow_endpoint": self.mediaflow_endpoint,
+            }
+            # swap cache atomico (non eliminiamo prima quella vecchia se esiste)
             self._auth_cache[channel_id] = {
                 "auth_data": {
                     "auth_host": auth_host,
@@ -389,15 +468,12 @@ class DLHDExtractor(BaseExtractor):
                     "auth_sig": auth_sig
                 },
                 "iframe_url": iframe_url,
-                "timestamp": __import__('time').time()
+                "stream_result": stream_result,
+                "timestamp": time.time()
             }
-            logger.info(f"Successfully cached auth data for channel_id: {channel_id}")
-
-            return {
-                "destination_url": clean_m3u8_url,
-                "request_headers": stream_headers,
-                "mediaflow_endpoint": self.mediaflow_endpoint,
-            }
+            logger.info(f"[DLHD] Cached/updated auth + stream channel={channel_id}")
+            self._ensure_background_refresh(channel_id, initial_url)
+            return stream_result
 
         try:
             parsed_original = urlparse(url)
@@ -413,7 +489,7 @@ class DLHDExtractor(BaseExtractor):
             if not channel_id:
                 raise ExtractorError(f"Unable to extract channel ID from {url}")
 
-            return await get_stream_data(baseurl, url, channel_id)
+            return await get_stream_data(baseurl, url, channel_id, force_refresh=kwargs.get('force_refresh', False))
 
         except Exception as e:
             raise ExtractorError(f"Extraction failed: {str(e)}")
