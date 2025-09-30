@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import psutil
 from typing import Dict, Optional, List
 from urllib.parse import urlparse
 import httpx
@@ -10,38 +9,46 @@ from collections import OrderedDict
 import time
 from urllib.parse import urljoin
 
+# psutil opzionale: se non disponibile non blocca (mem usage = 0)
+try:  # pragma: no cover
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover
+    psutil = None  # type: ignore
+
 logger = logging.getLogger(__name__)
 
 
 class HLSPreBuffer:
+    """Pre-buffer system for HLS streams to reduce latency and improve streaming performance.
+
+    Implementazione unificata (prima c'erano due classi). Gestisce:
+    - cache LRU segmenti
+    - mapping playlist -> segmenti e inverso
+    - loop di refresh playlist con inattività e target duration adattivo
     """
-    Pre-buffer system for HLS streams to reduce latency and improve streaming performance.
-    """
-    
+
     def __init__(self, max_cache_size: Optional[int] = None, prebuffer_segments: Optional[int] = None):
-        """
-        Initialize the HLS pre-buffer system.
-        
-        Args:
-            max_cache_size (int): Maximum number of segments to cache (uses config if None)
-            prebuffer_segments (int): Number of segments to pre-buffer ahead (uses config if None)
-        """
-        from collections import OrderedDict
-        import time
-        from urllib.parse import urljoin
         self.max_cache_size = max_cache_size or settings.hls_prebuffer_cache_size
         self.prebuffer_segments = prebuffer_segments or settings.hls_prebuffer_segments
         self.max_memory_percent = settings.hls_prebuffer_max_memory_percent
         self.emergency_threshold = settings.hls_prebuffer_emergency_threshold
-        # Cache LRU
         self.segment_cache: "OrderedDict[str, bytes]" = OrderedDict()
-        # Mappa playlist -> lista segmenti
         self.segment_urls: Dict[str, List[str]] = {}
-        # Mappa inversa segmento -> (playlist_url, index)
         self.segment_to_playlist: Dict[str, tuple[str, int]] = {}
-        # Stato per playlist: {headers, last_access, refresh_task, target_duration}
         self.playlist_state: Dict[str, dict] = {}
         self.client = create_httpx_client()
+
+    # ---------------- Parsing helpers ----------------
+    def _parse_target_duration(self, playlist_content: str) -> Optional[int]:
+        for line in playlist_content.splitlines():
+            line = line.strip()
+            if line.startswith("#EXT-X-TARGETDURATION:"):
+                try:
+                    value = line.split(":", 1)[1].strip()
+                    return int(float(value))
+                except Exception:
+                    return None
+        return None
         
     async def prebuffer_playlist(self, playlist_url: str, headers: Dict[str, str]) -> None:
         """
@@ -185,10 +192,12 @@ class HLSPreBuffer:
         Returns:
             float: Memory usage percentage
         """
+        if psutil is None:
+            return 0.0
         try:
             memory = psutil.virtual_memory()
             return memory.percent
-        except Exception as e:
+        except Exception as e:  # pragma: no cover
             logger.warning(f"Failed to get memory usage: {e}")
             return 0.0
     
@@ -348,31 +357,8 @@ class HLSPreBuffer:
         await self.client.aclose()
 
 
-# Global pre-buffer instance
-hls_prebuffer = HLSPreBuffer()
-
-
-class HLSPreBuffer:
-    def _parse_target_duration(self, playlist_content: str) -> Optional[int]:
-        """
-        Parse EXT-X-TARGETDURATION from a media playlist and return duration in seconds.
-        Returns None if not present or unparsable.
-        """
-        for line in playlist_content.splitlines():
-            line = line.strip()
-            if line.startswith("#EXT-X-TARGETDURATION:"):
-                try:
-                    value = line.split(":", 1)[1].strip()
-                    return int(float(value))
-                except Exception:
-                    return None
-        return None
-    
+    # ---------------- Refresh loop ----------------
     async def _refresh_playlist_loop(self, playlist_url: str, headers: Dict[str, str], target_duration: int) -> None:
-        """
-        Aggiorna periodicamente la playlist per seguire la sliding window e mantenere la cache coerente.
-        Interrompe e pulisce dopo inattività prolungata.
-        """
         sleep_s = max(2, min(15, int(target_duration)))
         inactivity_timeout = 600  # 10 minuti
         while True:
@@ -382,14 +368,11 @@ class HLSPreBuffer:
                 if not st:
                     return
                 if now - st.get("last_access", now) > inactivity_timeout:
-                    # cleanup specifico della playlist
                     urls = set(self.segment_urls.get(playlist_url, []))
                     if urls:
-                        # rimuovi dalla cache solo i segmenti di questa playlist
                         for u in list(self.segment_cache.keys()):
                             if u in urls:
                                 self.segment_cache.pop(u, None)
-                        # rimuovi mapping
                         for u in urls:
                             self.segment_to_playlist.pop(u, None)
                     self.segment_urls.pop(playlist_url, None)
@@ -397,7 +380,6 @@ class HLSPreBuffer:
                     logger.info(f"Stopped HLS prebuffer for inactive playlist: {playlist_url}")
                     return
 
-                # refresh manifest
                 resp = await self.client.get(playlist_url, headers=headers)
                 resp.raise_for_status()
                 content = resp.text
@@ -408,83 +390,12 @@ class HLSPreBuffer:
                 new_urls = self._extract_segment_urls(content, playlist_url)
                 if new_urls:
                     self.segment_urls[playlist_url] = new_urls
-                    # rebuild reverse map per gli ultimi N (limita la memoria)
                     for idx, u in enumerate(new_urls[-(self.max_cache_size * 2):]):
-                        # rimappiando sovrascrivi eventuali entry
                         real_idx = len(new_urls) - (self.max_cache_size * 2) + idx if len(new_urls) > (self.max_cache_size * 2) else idx
                         self.segment_to_playlist[u] = (playlist_url, real_idx)
-
-                # tenta un prebuffer proattivo: se conosciamo l'ultimo segmento accessibile, anticipa i successivi
-                # Non conosciamo l'indice di riproduzione corrente qui, quindi non facciamo nulla di aggressivo.
-
-            except Exception as e:
+            except Exception as e:  # pragma: no cover
                 logger.debug(f"Playlist refresh error for {playlist_url}: {e}")
             await asyncio.sleep(sleep_s)
-    def _extract_segment_urls(self, playlist_content: str, base_url: str) -> List[str]:
-        """
-        Extract segment URLs from HLS playlist content.
-        
-        Args:
-            playlist_content (str): Content of the HLS playlist
-            base_url (str): Base URL for resolving relative URLs
-            
-        Returns:
-            List[str]: List of segment URLs
-        """
-        segment_urls = []
-        lines = playlist_content.split('\n')
-        
-        logger.debug(f"Analyzing playlist with {len(lines)} lines")
-        
-        for line in lines:
-            line = line.strip()
-            if line and not line.startswith('#'):
-                # Check if line contains a URL (http/https) or is a relative path
-                if 'http://' in line or 'https://' in line:
-                    segment_urls.append(line)
-                    logger.debug(f"Found absolute URL: {line}")
-                elif line and not line.startswith('#'):
-                    # This might be a relative path to a segment
-                    parsed_base = urlparse(base_url)
-                    # Ensure proper path joining
-                    if line.startswith('/'):
-                        segment_url = f"{parsed_base.scheme}://{parsed_base.netloc}{line}"
-                    else:
-                        # Get the directory path from base_url
-                        base_path = parsed_base.path.rsplit('/', 1)[0] if '/' in parsed_base.path else ''
-                        segment_url = f"{parsed_base.scheme}://{parsed_base.netloc}{base_path}/{line}"
-                    segment_urls.append(segment_url)
-                    logger.debug(f"Found relative path: {line} -> {segment_url}")
-        
-        logger.debug(f"Extracted {len(segment_urls)} segment URLs from playlist")
-        if segment_urls:
-            logger.debug(f"First segment URL: {segment_urls[0]}")
-        else:
-            logger.debug("No segment URLs found in playlist")
-            # Log first few lines for debugging
-            for i, line in enumerate(lines[:10]):
-                logger.debug(f"Line {i}: {line}")
-        
-        return segment_urls
-    
-    def _extract_variant_urls(self, playlist_content: str, base_url: str) -> List[str]:
-        """
-        Estrae le varianti dal master playlist. Corretto per gestire URI relativi:
-        prende la riga non-commento successiva a #EXT-X-STREAM-INF e la risolve rispetto a base_url.
-        """
-        from urllib.parse import urljoin
-        variant_urls = []
-        lines = [l.strip() for l in playlist_content.split('\n')]
-        take_next_uri = False
-        for line in lines:
-            if line.startswith("#EXT-X-STREAM-INF"):
-                take_next_uri = True
-                continue
-            if take_next_uri:
-                take_next_uri = False
-                if line and not line.startswith('#'):
-                    variant_urls.append(urljoin(base_url, line))
-        logger.debug(f"Extracted {len(variant_urls)} variant URLs from master playlist")
-        if variant_urls:
-            logger.debug(f"First variant URL: {variant_urls[0]}")
-        return variant_urls
+
+# Global pre-buffer instance (singola)
+hls_prebuffer = HLSPreBuffer()
